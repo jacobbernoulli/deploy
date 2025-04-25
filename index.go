@@ -22,6 +22,7 @@ import (
 
 type Config struct {
 	Token                string `env:"TOKEN"`
+	Environment          string `env:"ENVIRONMENT"`
 	Branch               string `env:"BRANCH"`
 	DeploymentLocation   string `env:"DEPLOYMENT_LOCATION"`
 	DeploymentChannel    string `env:"DEPLOYMENT_CHANNEL"`
@@ -36,7 +37,7 @@ var (
 	Commands COMMANDS_DICTIONARY
 )
 
-func sendDiscordWebhookMessage(status, branch string) {
+func sendDiscordWebhookMessage(status, branch string, author string) {
 	success := status == "success"
 	color := 0x008000
 	description := "Deployment Successful!"
@@ -54,7 +55,7 @@ func sendDiscordWebhookMessage(status, branch string) {
 				"fields": []map[string]any{
 					{
 						"name":   "Environment",
-						"value":  "Production",
+						"value":  data.Environment,
 						"inline": true,
 					},
 					{
@@ -67,8 +68,7 @@ func sendDiscordWebhookMessage(status, branch string) {
 					"url": "https://r2.fivemanage.com/3i2fhQIkHIaRFDy1YIvi8/images/image.png",
 				},
 				"footer": map[string]any{
-					"text":     "Deployment Bot",
-					"icon_url": "https://r2.fivemanage.com/3i2fhQIkHIaRFDy1YIvi8/images/image.png",
+					"text": "User ID: " + author,
 				},
 				"timestamp": time.Now().Format(time.RFC3339),
 			},
@@ -88,13 +88,12 @@ func getConfig() (*Config, error) {
 	val := reflect.ValueOf(config).Elem()
 
 	for i := range val.NumField() {
-		key := val.Field(i)
 		str := val.Type().Field(i).Tag.Get("env")
 		value, input := os.LookupEnv(str)
 		if !input || strings.TrimSpace(value) == "" {
 			return nil, fmt.Errorf("missing environment variable: %s", str)
 		}
-		key.SetString(value)
+		val.Field(i).SetString(value)
 	}
 
 	return config, nil
@@ -114,70 +113,54 @@ func getDictionary(Dictionary any) error {
 }
 
 func deploy(session *discordgo.Session, message *discordgo.MessageCreate) {
-	if message.Author.Bot || message.ChannelID != data.DeploymentChannel || !strings.HasPrefix(message.Content, "!") {
-		return
-	}
-
 	member, err := session.GuildMember(message.GuildID, message.Author.ID)
-	if err != nil {
+	if err != nil || !strings.HasPrefix(message.Content, "!") || message.Author.Bot || message.ChannelID != data.DeploymentChannel || !slices.Contains(member.Roles, data.DeploymentRole) {
 		return
 	}
 
-	if !slices.Contains(member.Roles, data.DeploymentRole) {
-		session.ChannelMessageSend(message.ChannelID, "You do not have permission to deploy.")
-		return
-	}
-
-	args := strings.Split(strings.TrimPrefix(message.Content, "!"), " ")
+	args := strings.Fields(strings.TrimPrefix(message.Content, "!"))
 	if len(args) < 3 {
+		session.ChannelMessageSend(message.ChannelID, "Missing fields - !deploy <branch> <key>")
 		return
 	}
 
 	command, branch, key := strings.ToLower(args[0]), strings.ToLower(args[1]), args[2]
 	if command != "deploy" {
-		session.ChannelMessageSend(message.ChannelID, fmt.Sprintf("Invalid command `(%s)` specified.", command))
 		return
 	}
 
-	cache, option := Commands[key]
-	if !option {
-		session.ChannelMessageSend(message.ChannelID, fmt.Sprintf("Invalid key `(%s)` specified.", key))
+	if _, ok := Commands[key]; !ok {
+		session.ChannelMessageSend(message.ChannelID, fmt.Sprintf("Invalid key name `(%s)` specified.", key))
 		return
 	}
 
-	branches := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(branch) && branch == data.Branch
-	if !branches {
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(branch) || branch != data.Branch {
 		session.ChannelMessageSend(message.ChannelID, fmt.Sprintf("Invalid branch `(%s)` specified.", branch))
-		sendDiscordWebhookMessage("failed", branch)
+		sendDiscordWebhookMessage("failed", branch, message.Author.ID)
 		return
 	}
 
-	session.ChannelMessageSend(message.ChannelID, "Deploying ongoing...")
+	msg, err := session.ChannelMessageSend(message.ChannelID, "Deploying ongoing...")
+	if err != nil {
+		return
+	}
 
 	go func() {
-		location := strings.ReplaceAll(cache, "${LOCATION}", data.DeploymentLocation)
-		replace := strings.ReplaceAll(location, "${BRANCH}", branch)
+		command := strings.ReplaceAll(strings.ReplaceAll(Commands[key], "${LOCATION}", data.DeploymentLocation), "${BRANCH}", branch)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		cmd := exec.CommandContext(ctx, "bash", "-c", replace)
-
-		output, err := cmd.CombinedOutput()
+		output, err := exec.CommandContext(ctx, "bash", "-c", command).CombinedOutput()
 		if err != nil {
-			session.ChannelMessageSend(message.ChannelID, fmt.Sprintf("Deployment Failed: %s", err.Error()))
-			sendDiscordWebhookMessage("failed", branch)
-			log.Fatalf("cmd.CombinedOutput(): %v\n%s", err, string(output))
+			session.ChannelMessageEdit(message.ChannelID, msg.ID, fmt.Sprintf("Deployment failed: `%s`", err.Error()))
+			log.Printf("cmd.CombinedOutput(): %v\n%s", err, string(output))
 			return
 		}
 
-		success := "Deployment successful; wait 10s before restart."
-		if branch != data.Branch {
-			success += fmt.Sprintf(" Make sure to return to main branch once done (e.g., `!deploy %s confirm`).", data.Branch)
-		}
-
-		session.ChannelMessageSend(message.ChannelID, success)
-		sendDiscordWebhookMessage("success", branch)
+		session.ChannelMessageEdit(message.ChannelID, msg.ID, "Deployment successful, wait at least 10s if you need to restart.")
+		sendDiscordWebhookMessage("success", branch, message.Author.ID)
+		log.Printf("Deployment successful. Username: %s (%s) - Branch: %s - Executed: %s", message.Author.Username, message.Author.ID, branch, command)
 	}()
 }
 
