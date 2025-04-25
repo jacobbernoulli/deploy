@@ -1,0 +1,3 @@
+{
+  "confirm": "git -C ${LOCATION} reset --hard && git -C ${LOCATION} fetch && git -C ${LOCATION} checkout ${BRANCH} && git -C ${LOCATION} pull origin ${BRANCH}"
+}
